@@ -1,8 +1,9 @@
-"""SOTA config: Parallel Muon + parameter banks + MLP 3.5x + 11L XSA + GPTQ-lite int6 + zstd-22."""
+"""SOTA config: Parallel Muon + parameter banks + MLP 3x + 11L XSA + LN Scale + VE128 + GPTQ-lite int6 + LZMA."""
 from __future__ import annotations
 import copy
 import glob
 import io
+import lzma
 import math
 import os
 import random
@@ -15,11 +16,20 @@ from pathlib import Path
 
 try:
     import zstandard
-    def _compress(data: bytes) -> bytes: return zstandard.ZstdCompressor(level=22).compress(data)
-    def _decompress(data: bytes) -> bytes: return zstandard.ZstdDecompressor().decompress(data)
 except ImportError:
-    def _compress(data: bytes) -> bytes: return zlib.compress(data, level=9)
-    def _decompress(data: bytes) -> bytes: return zlib.decompress(data)
+    zstandard = None
+
+def _compress(data: bytes) -> bytes:
+    return lzma.compress(data, preset=6)
+
+def _decompress(data: bytes) -> bytes:
+    try:
+        return lzma.decompress(data)
+    except Exception:
+        try:
+            return zstandard.ZstdDecompressor().decompress(data)
+        except Exception:
+            return zlib.decompress(data)
 
 import numpy as np
 import sentencepiece as spm
@@ -85,8 +95,12 @@ class Hyperparameters:
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1536))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
+    ve_dim = int(os.environ.get("VE_DIM", 128))
+    ve_layers = os.environ.get("VE_LAYERS", "9,10")
 
     use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "1")))
     use_bigramhash = bool(int(os.environ.get("USE_BIGRAMHASH", "1")))
@@ -122,7 +136,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
         "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights,"
-        "smear,bigram_scale,vr_lambda,attn_gate",
+        "smear,bigram_scale,vr_lambda,attn_gate,ve_layer_scales,ve_shared.scale",
     ).split(",")
     if pattern
 )
@@ -870,7 +884,7 @@ class CastedLinear(nn.Linear):
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
                 scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -31, 31) * scale[:, None]).to(x.dtype)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()  # STE
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -968,6 +982,21 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+class ValueEmbedding(nn.Module):
+    """Reinject token identity into attention values at specific layers."""
+    def __init__(self, vocab_size: int, ve_dim: int, kv_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, ve_dim)
+        nn.init.normal_(self.embed.weight, std=0.01)
+        self.proj = CastedLinear(ve_dim, kv_dim, bias=False)
+        nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.proj(self.embed(token_ids))
+        return h * self.scale.to(dtype=h.dtype)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -1015,11 +1044,14 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         bsz, seqlen, dim = x.shape
         q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = F.linear(x, v_w.to(x.dtype))
+        if v_embed is not None:
+            v = v + v_embed
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         raw_v = v if self.value_residual else None
         if self.value_residual and v0 is not None:
@@ -1075,6 +1107,7 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         layer_idx: int = 0,
+        ln_scale: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
     ):
@@ -1087,13 +1120,14 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in), q_w, k_w, v_w, out_w, v0=v0)
+        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out), up_w, down_w)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out, raw_v
 
 
@@ -1115,11 +1149,16 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
+        ln_scale: bool = False,
+        ve_enabled: bool = False,
+        ve_dim: int = 128,
+        ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
         use_smeargate: bool = False,
     ):
         super().__init__()
+        self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
@@ -1152,6 +1191,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     layer_idx=i,
+                    ln_scale=ln_scale,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
                 )
@@ -1166,6 +1206,17 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # Value Embeddings
+        self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
+        kv_dim_ve = self._ve_target_dim
+        if self.ve_layer_indices:
+            self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim_ve)
+            self.ve_layer_scales = nn.ParameterList(
+                [nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices]
+            )
+        else:
+            self.ve_shared = None
+            self.ve_layer_scales = nn.ParameterList()
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1196,6 +1247,16 @@ class GPT(nn.Module):
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
+    def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
+        """Get value embedding for a specific layer using shared table + per-layer scale."""
+        if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
+            return None
+        if ve_cache is not None and 've' not in ve_cache:
+            ve_cache['ve'] = self.ve_shared(input_ids)
+        ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
+        ve_idx = self.ve_layer_indices.index(layer_idx)
+        return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+
     def _forward_body(self, input_ids: Tensor) -> Tensor:
         """Shared forward body: input_ids -> final hidden states."""
         n = self.num_layers
@@ -1208,11 +1269,13 @@ class GPT(nn.Module):
         x0 = x
         v0 = None
         skips: list[Tensor] = []
+        ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v0=v0)
+                v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1220,10 +1283,11 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v0=v0)
+                v_embed=ve, v0=v0)
         return self.final_norm(x)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
@@ -1266,9 +1330,9 @@ def _qat_forward_linear(x: Tensor, w: Tensor) -> Tensor:
             scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
             # For 3D banks, scale has shape [B, rows]; for 2D, [rows]
             if w32.ndim == 2:
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -31, 31) * scale[:, None]).to(x.dtype)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
             else:
-                w_q = (torch.clamp(torch.round(w32 / scale[..., None]), -31, 31) * scale[..., None]).to(x.dtype)
+                w_q = (torch.clamp(torch.round(w32 / scale[..., None]), -32, 31) * scale[..., None]).to(x.dtype)
         w_cast = w_cast + (w_q - w_cast).detach()
     return F.linear(x, w_cast)
 
@@ -1373,6 +1437,10 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
+        ve_enabled=args.ve_enabled,
+        ve_dim=args.ve_dim,
+        ve_layers=args.ve_layers,
         gated_attention=args.use_gated_attention,
         value_residual=args.use_value_residual,
         use_smeargate=args.use_smeargate,
@@ -1418,6 +1486,13 @@ def main() -> None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             scalar_params.append(base_model.bigram.proj.weight)
+    if base_model.ve_shared is not None:
+        tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.ve_shared.proj is not None:
+            scalar_params.append(base_model.ve_shared.proj.weight)
+        scalar_params.append(base_model.ve_shared.scale)
+        for s in base_model.ve_layer_scales:
+            scalar_params.append(s)
 
     optimizer_tok = torch.optim.AdamW(
         tok_params,
@@ -1764,6 +1839,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale, ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.use_gated_attention, value_residual=args.use_value_residual,
         use_smeargate=args.use_smeargate,
     ).to(device).bfloat16()
