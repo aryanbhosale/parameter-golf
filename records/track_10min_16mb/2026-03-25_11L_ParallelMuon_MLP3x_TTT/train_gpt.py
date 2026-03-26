@@ -1,9 +1,8 @@
-"""SOTA config: Parallel Muon + parameter banks + MLP 3x + 11L XSA + LN Scale + VE128 + GPTQ-lite int6 + LZMA."""
+"""SOTA config: Parallel Muon + parameter banks + MLP 3x + 11L XSA + LN Scale + GPTQ-lite int6 + zstd-22."""
 from __future__ import annotations
 import copy
 import glob
 import io
-import lzma
 import math
 import os
 import random
@@ -16,20 +15,11 @@ from pathlib import Path
 
 try:
     import zstandard
+    def _compress(data: bytes) -> bytes: return zstandard.ZstdCompressor(level=22).compress(data)
+    def _decompress(data: bytes) -> bytes: return zstandard.ZstdDecompressor().decompress(data)
 except ImportError:
-    zstandard = None
-
-def _compress(data: bytes) -> bytes:
-    return lzma.compress(data, preset=6)
-
-def _decompress(data: bytes) -> bytes:
-    try:
-        return lzma.decompress(data)
-    except Exception:
-        try:
-            return zstandard.ZstdDecompressor().decompress(data)
-        except Exception:
-            return zlib.decompress(data)
+    def _compress(data: bytes) -> bytes: return zlib.compress(data, level=9)
+    def _decompress(data: bytes) -> bytes: return zlib.decompress(data)
 
 import numpy as np
 import sentencepiece as spm
@@ -95,11 +85,11 @@ class Hyperparameters:
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1536))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
-    ve_dim = int(os.environ.get("VE_DIM", 64))
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
+    ve_dim = int(os.environ.get("VE_DIM", 32))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
 
     use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "1")))
