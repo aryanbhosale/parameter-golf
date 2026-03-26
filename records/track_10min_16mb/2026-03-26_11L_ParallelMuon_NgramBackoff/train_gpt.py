@@ -460,6 +460,9 @@ def eval_val_ngram(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     byte_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
+    # Track per-chunk (loss, bytes) for two-pass rescoring
+    chunk_losses: list[float] = []
+    chunk_bytes_list: list[float] = []
 
     # Build sliding window segments
     segments = []
@@ -490,6 +493,9 @@ def eval_val_ngram(
                 seg_idx += 1
             rank_segs = chunk_segs[rank::world_size]
 
+            chunk_loss_acc = 0.0
+            chunk_byte_acc = 0.0
+
             for bi in range(0, len(rank_segs), batch_seqs):
                 batch = rank_segs[bi:bi + batch_seqs]
                 bsz = len(batch)
@@ -502,7 +508,7 @@ def eval_val_ngram(
                     y_batch[ri, :vl] = chunk[1:]
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = model(x_batch)  # forward returns logits when no target
+                    logits = model(x_batch)
 
                 for ri, (_, _, ls, le, ts, te) in enumerate(batch):
                     seg_len = te - ts
@@ -513,7 +519,6 @@ def eval_val_ngram(
                     seg_model_p = torch.gather(model_probs, 1, row_targets.unsqueeze(-1)).squeeze(-1)
                     seg_model_p = seg_model_p.clamp(min=1e-10).cpu().numpy().astype(np.float64)
 
-                    # Entropy for adaptive alpha
                     log_probs = torch.log_softmax(row_logits, dim=-1)
                     seg_entropy = -(model_probs * log_probs).sum(dim=-1).cpu().numpy()
 
@@ -532,22 +537,38 @@ def eval_val_ngram(
                         final_p[ng_matched] = (1.0 - alpha) * seg_model_p[ng_matched] + alpha * ngram_p[ng_matched]
                         final_p = np.maximum(final_p, 1e-10)
 
-                    loss_sum += float((-np.log(final_p)).sum())
+                    seg_loss = float((-np.log(final_p)).sum())
+                    loss_sum += seg_loss
+                    chunk_loss_acc += seg_loss
 
                     scored_x = x_batch[ri, ls:le]
                     scored_y = y_batch[ri, ls:le]
                     tok_bytes = base_bytes_lut[scored_y].to(torch.int16)
                     tok_bytes += (has_leading_space_lut[scored_y] & ~is_boundary_token_lut[scored_x]).to(torch.int16)
-                    byte_sum += tok_bytes.to(torch.float64).sum()
+                    seg_bytes = float(tok_bytes.to(torch.float64).sum().item())
+                    byte_sum += seg_bytes
+                    chunk_byte_acc += seg_bytes
                     token_count += seg_len
+
+            # Reduce per-chunk values across ranks for accurate tracking
+            if dist.is_available() and dist.is_initialized():
+                cl_t = torch.tensor(chunk_loss_acc, device=device, dtype=torch.float64)
+                cb_t = torch.tensor(chunk_byte_acc, device=device, dtype=torch.float64)
+                dist.all_reduce(cl_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(cb_t, op=dist.ReduceOp.SUM)
+                chunk_losses.append(float(cl_t.item()))
+                chunk_bytes_list.append(float(cb_t.item()))
+            else:
+                chunk_losses.append(chunk_loss_acc)
+                chunk_bytes_list.append(chunk_byte_acc)
 
             cache.update_batch(tokens_np, chunk_start, chunk_end)
 
-            if rank == 0 and (chunk_start // chunk_tokens) % 20 == 0:
+            if rank == 0 and len(chunk_losses) % 20 == 0:
                 elapsed = time.perf_counter() - t0
                 rl = loss_sum.item() / max(token_count.item(), 1)
                 rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_sum.item(), 1)) if token_count.item() > 0 else 0.0
-                log_fn(f"  ngram_chunk [{chunk_start // chunk_tokens}/{(total_tokens + chunk_tokens - 1) // chunk_tokens}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+                log_fn(f"  ngram_chunk [{len(chunk_losses)}/{(total_tokens + chunk_tokens - 1) // chunk_tokens}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -565,13 +586,12 @@ def eval_val_ngram(
         actual_rescore = min(args.ngram_rescore_chunks, n_total_chunks)
         log_fn(f"ngram_pass2: rescoring first {actual_rescore} chunks with full cache...")
 
-        # Rebuild segments for the first N chunks
+        # Sum pass1 losses for chunks being rescored
+        p1_rescore_loss = sum(chunk_losses[:actual_rescore])
+        p1_rescore_bytes = sum(chunk_bytes_list[:actual_rescore])
+
         p2_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
         p2_byte_sum = torch.zeros((), device=device, dtype=torch.float64)
-        p2_token_count = torch.zeros((), device=device, dtype=torch.float64)
-        # Also track pass1 values for same chunks to compute delta
-        p1_chunk_loss = torch.zeros((), device=device, dtype=torch.float64)
-        p1_chunk_bytes = torch.zeros((), device=device, dtype=torch.float64)
 
         seg_idx_p2 = 0
         with torch.inference_mode():
@@ -631,22 +651,14 @@ def eval_val_ngram(
                         tok_bytes = base_bytes_lut[scored_y].to(torch.int16)
                         tok_bytes += (has_leading_space_lut[scored_y] & ~is_boundary_token_lut[scored_x]).to(torch.int16)
                         p2_byte_sum += tok_bytes.to(torch.float64).sum()
-                        p2_token_count += seg_len_p2
-
-                        # Track pass1 contribution for same tokens (model-only, no ngram for cold chunks)
-                        p1_only_loss = float((-np.log(np.maximum(seg_model_p, 1e-10))).sum())
-                        p1_chunk_loss += p1_only_loss
-                        p1_chunk_bytes += tok_bytes.to(torch.float64).sum()
 
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(p2_loss_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(p2_byte_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(p1_chunk_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(p1_chunk_bytes, op=dist.ReduceOp.SUM)
 
         # Replace pass1 cold-chunk scores with pass2 warm-cache scores
-        total_loss = p1_loss - p1_chunk_loss.item() + p2_loss_sum.item()
-        total_bytes = p1_bytes - p1_chunk_bytes.item() + p2_byte_sum.item()
+        total_loss = p1_loss - p1_rescore_loss + p2_loss_sum.item()
+        total_bytes = p1_bytes - p1_rescore_bytes + p2_byte_sum.item()
         val_bpb = float((total_loss / math.log(2.0)) / total_bytes)
         val_loss = total_loss / token_count.item()
         log_fn(f"ngram_pass2:done bpb={val_bpb:.6f} (p1={p1_bpb:.6f}, improvement={p1_bpb - val_bpb:+.4f}) elapsed={time.perf_counter() - t0:.1f}s")
