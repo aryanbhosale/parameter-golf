@@ -89,7 +89,7 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1536))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1024))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -502,17 +502,13 @@ def eval_val_ttt(
     log_fn(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params_all)} "
            f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
-    # Build per-param LR multiplier map for Muon TTT
-    param_lr_mul = {}
-    for pg in ttt_param_groups:
-        for p in pg['params']:
-            param_lr_mul[id(p)] = pg['lr'] / args.ttt_lr  # store multiplier relative to base
-
     use_muon_ttt = args.ttt_muon
     if not use_muon_ttt:
+        # SGD TTT: per-layer LR groups
         optimizer = torch.optim.SGD(ttt_param_groups, lr=args.ttt_lr, momentum=args.ttt_momentum)
     else:
-        optimizer = None  # Muon-style manual update
+        # Muon TTT: flat LR (NS already normalizes gradients — per-layer LR causes instability)
+        optimizer = None
     batch_seqs = args.ttt_batch_seqs
     t0 = time.perf_counter()
 
@@ -627,7 +623,7 @@ def eval_val_ttt(
                         if not use_muon_ttt and optimizer is not None:
                             optimizer.step()
                         else:
-                            # Muon-style update: NS orthogonalization for matrices, plain LR for vectors
+                            # Muon-style update: NS orthogonalization for matrices, flat LR for vectors
                             with torch.no_grad():
                                 for p in ttt_params_all:
                                     if p.grad is None:
@@ -635,8 +631,7 @@ def eval_val_ttt(
                                     g = p.grad.detach().float()
                                     if g.ndim >= 2:
                                         g = zeropower_via_newtonschulz5(g, steps=args.ttt_ns_steps)
-                                    plr = cos_lr * param_lr_mul.get(id(p), 1.0)
-                                    p.data.add_(g.to(p.dtype), alpha=-plr)
+                                    p.data.add_(g.to(p.dtype), alpha=-cos_lr)
 
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
