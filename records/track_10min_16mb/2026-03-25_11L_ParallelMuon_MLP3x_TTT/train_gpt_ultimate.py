@@ -90,7 +90,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1024))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
