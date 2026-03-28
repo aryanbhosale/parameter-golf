@@ -137,7 +137,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
         "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights,"
-        "smear,bigram_scale,vr_lambda,attn_gate,ve_layer_scales,ve_shared.scale,mhc_alpha,mhc_beta",
+        "smear,bigram_scale,vr_lambda,attn_gate,ve_layer_scales,ve_shared.scale",
     ).split(",")
     if pattern
 )
@@ -1182,8 +1182,6 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
-        self.mhc_alpha = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.mhc_beta = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -1191,10 +1189,6 @@ class Block(nn.Module):
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
-        norm = (self.mhc_alpha ** 2 + self.mhc_beta ** 2).sqrt().clamp(min=1e-6)
-        alpha_n = (self.mhc_alpha / norm * math.sqrt(2)).to(dtype=x_out.dtype)
-        block_delta = x_out - x_in
-        x_out = x_in + alpha_n * block_delta
         return x_out, raw_v
 
 
